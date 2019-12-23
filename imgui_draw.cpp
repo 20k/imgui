@@ -1599,12 +1599,28 @@ void    ImFontAtlas::Clear()
 
 void    ImFontAtlas::GetTexDataAsAlpha8(unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel)
 {
-    // Build atlas on demand
+    // Convert from RGBA32 to Alpha8 dynamically, currently only uses the alpha component and ignores the RGB component
     if (TexPixelsAlpha8 == NULL)
     {
-        if (ConfigData.empty())
-            AddFontDefault();
-        Build();
+        unsigned int* pixels = NULL;
+        GetTexDataAsRGBA32((unsigned char**)&pixels, NULL, NULL);
+
+        if (pixels)
+        {
+            TexPixelsAlpha8 = (unsigned char*)IM_ALLOC((size_t)TexWidth * (size_t)TexHeight);
+            for (int y = 0; y < TexHeight; y++)
+            {
+                for (int x = 0; x < TexWidth; x++)
+                {
+                    // Assuming that stb_ outputs linear coverage, which it should do because its alpha
+                    // This passes along just the alpha value, it would be possible to use
+                    // RGB data here as well and calculate luminance for RGB fonts, except that nothing in Dear ImGui uses it currently
+                    unsigned char alpha = (pixels[y * TexWidth + x] >> IM_COL32_A_SHIFT) & 0xFF;
+
+                    TexPixelsAlpha8[y * TexWidth + x] = alpha;
+                }
+            }
+        }
     }
 
     *out_pixels = TexPixelsAlpha8;
@@ -1614,21 +1630,13 @@ void    ImFontAtlas::GetTexDataAsAlpha8(unsigned char** out_pixels, int* out_wid
 }
 
 void    ImFontAtlas::GetTexDataAsRGBA32(unsigned char** out_pixels, int* out_width, int* out_height, int* out_bytes_per_pixel)
-{
-    // Convert to RGBA32 format on demand
-    // Although it is likely to be the most commonly used format, our font rendering is 1 channel / 8 bpp
-    if (!TexPixelsRGBA32)
+{    
+    if (TexPixelsRGBA32 == NULL)
     {
-        unsigned char* pixels = NULL;
-        GetTexDataAsAlpha8(&pixels, NULL, NULL);
-        if (pixels)
-        {
-            TexPixelsRGBA32 = (unsigned int*)IM_ALLOC((size_t)TexWidth * (size_t)TexHeight * 4);
-            const unsigned char* src = pixels;
-            unsigned int* dst = TexPixelsRGBA32;
-            for (int n = TexWidth * TexHeight; n > 0; n--)
-                *dst++ = IM_COL32(255, 255, 255, (unsigned int)(*src++));
-        }
+        if (ConfigData.empty())
+            AddFontDefault();
+
+        Build();
     }
 
     *out_pixels = (unsigned char*)TexPixelsRGBA32;
@@ -2060,9 +2068,9 @@ bool    ImFontAtlasBuildWithStbTruetype(ImFontAtlas* atlas)
     // 7. Allocate texture
     atlas->TexHeight = (atlas->Flags & ImFontAtlasFlags_NoPowerOfTwoHeight) ? (atlas->TexHeight + 1) : ImUpperPowerOfTwo(atlas->TexHeight);
     atlas->TexUvScale = ImVec2(1.0f / atlas->TexWidth, 1.0f / atlas->TexHeight);
-    atlas->TexPixelsAlpha8 = (unsigned char*)IM_ALLOC(atlas->TexWidth * atlas->TexHeight);
-    memset(atlas->TexPixelsAlpha8, 0, atlas->TexWidth * atlas->TexHeight);
-    spc.pixels = atlas->TexPixelsAlpha8;
+    unsigned char* alpha8 = (unsigned char*)IM_ALLOC(atlas->TexWidth * atlas->TexHeight);
+    memset(alpha8, 0, atlas->TexWidth * atlas->TexHeight);
+    spc.pixels = alpha8;
     spc.height = atlas->TexHeight;
 
     // 8. Render/rasterize font characters into the texture
@@ -2083,7 +2091,7 @@ bool    ImFontAtlasBuildWithStbTruetype(ImFontAtlas* atlas)
             stbrp_rect* r = &src_tmp.Rects[0];
             for (int glyph_i = 0; glyph_i < src_tmp.GlyphsCount; glyph_i++, r++)
                 if (r->was_packed)
-                    ImFontAtlasBuildMultiplyRectAlpha8(multiply_table, atlas->TexPixelsAlpha8, r->x, r->y, r->w, r->h, atlas->TexWidth * 1);
+                    ImFontAtlasBuildMultiplyRectAlpha8(multiply_table, alpha8, r->x, r->y, r->w, r->h, atlas->TexWidth * 1);
         }
         src_tmp.Rects = NULL;
     }
@@ -2134,6 +2142,22 @@ bool    ImFontAtlasBuildWithStbTruetype(ImFontAtlas* atlas)
     // Cleanup temporary (ImVector doesn't honor destructor)
     for (int src_i = 0; src_i < src_tmp_array.Size; src_i++)
         src_tmp_array[src_i].~ImFontBuildSrcData();
+        
+    atlas->TexPixelsRGBA32 = (unsigned int*)IM_ALLOC(atlas->TexWidth * atlas->TexHeight * 4);
+    memset(atlas->TexPixelsRGBA32, 0, atlas->TexWidth * atlas->TexHeight * 4);
+
+    for (int y = 0; y < atlas->TexHeight; y++)
+    {
+        for (int x = 0; x < atlas->TexWidth; x++)
+        {
+            unsigned char val_alpha8 = alpha8[y * atlas->TexWidth + x];
+
+            atlas->TexPixelsRGBA32[y * atlas->TexWidth + x] = IM_COL32(0xFF, 0xFF, 0xFF, val_alpha8);
+        }
+    }
+
+    // Derive the 8 bit alpha component from rgba32 instead
+    IM_FREE(alpha8);
 
     ImFontAtlasBuildFinish(atlas);
     return true;
@@ -2193,7 +2217,7 @@ void ImFontAtlasBuildPackCustomRects(ImFontAtlas* atlas, void* stbrp_context_opa
 static void ImFontAtlasBuildRenderDefaultTexData(ImFontAtlas* atlas)
 {
     IM_ASSERT(atlas->CustomRectIds[0] >= 0);
-    IM_ASSERT(atlas->TexPixelsAlpha8 != NULL);
+    IM_ASSERT(atlas->TexPixelsRGBA32 != NULL);
     ImFontAtlasCustomRect& r = atlas->CustomRects[atlas->CustomRectIds[0]];
     IM_ASSERT(r.ID == FONT_ATLAS_DEFAULT_TEX_DATA_ID);
     IM_ASSERT(r.IsPacked());
@@ -2208,15 +2232,15 @@ static void ImFontAtlasBuildRenderDefaultTexData(ImFontAtlas* atlas)
             {
                 const int offset0 = (int)(r.X + x) + (int)(r.Y + y) * w;
                 const int offset1 = offset0 + FONT_ATLAS_DEFAULT_TEX_DATA_W_HALF + 1;
-                atlas->TexPixelsAlpha8[offset0] = FONT_ATLAS_DEFAULT_TEX_DATA_PIXELS[n] == '.' ? 0xFF : 0x00;
-                atlas->TexPixelsAlpha8[offset1] = FONT_ATLAS_DEFAULT_TEX_DATA_PIXELS[n] == 'X' ? 0xFF : 0x00;
+                atlas->TexPixelsRGBA32[offset0] = FONT_ATLAS_DEFAULT_TEX_DATA_PIXELS[n] == '.' ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0x00, 0x00, 0x00, 0x00);
+                atlas->TexPixelsRGBA32[offset1] = FONT_ATLAS_DEFAULT_TEX_DATA_PIXELS[n] == 'X' ? IM_COL32(0xFF, 0xFF, 0xFF, 0xFF) : IM_COL32(0x00, 0x00, 0x00, 0x00);
             }
     }
     else
     {
         IM_ASSERT(r.Width == 2 && r.Height == 2);
         const int offset = (int)(r.X) + (int)(r.Y) * w;
-        atlas->TexPixelsAlpha8[offset] = atlas->TexPixelsAlpha8[offset + 1] = atlas->TexPixelsAlpha8[offset + w] = atlas->TexPixelsAlpha8[offset + w + 1] = 0xFF;
+        atlas->TexPixelsRGBA32[offset] = atlas->TexPixelsRGBA32[offset + 1] = atlas->TexPixelsRGBA32[offset + w] = atlas->TexPixelsRGBA32[offset + w + 1] = IM_COL32(0xFF, 0xFF, 0xFF, 0xFF);
     }
     atlas->TexUvWhitePixel = ImVec2((r.X + 0.5f) * atlas->TexUvScale.x, (r.Y + 0.5f) * atlas->TexUvScale.y);
 }
